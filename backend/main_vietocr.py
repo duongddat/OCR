@@ -179,6 +179,19 @@ async def extract_text(image: UploadFile = File(...)):
                     # Bước 2: Nhận diện với VietOCR
                     text, conf = models["recognizer"].predict(cropped, return_prob=True)
                     text = text.strip()
+                    
+                    # FIX: VietOCR hay bị lỗi trộn chữ HOA với dấu thường (VD: "NGHIệP NGHèO")
+                    # Nếu một từ có phần lớn là in hoa, ta sẽ ép nó thành in hoa chuẩn (VD: NGHIỆP NGHÈO)
+                    fixed_words = []
+                    for w in text.split():
+                        alphas = [c for c in w if c.isalpha()]
+                        if len(alphas) >= 2:
+                            uppers = sum(1 for c in alphas if c.isupper())
+                            if uppers >= 2 and uppers >= len(alphas) / 2:
+                                fixed_words.append(w.upper())
+                                continue
+                        fixed_words.append(w)
+                    text = " ".join(fixed_words)
 
                     # LỌC 2 — CONFIDENCE: Bỏ qua nếu VietOCR không tự tin
                     # Ngưỡng 0.45 (nếu có): đủ chặt để loại nhiễu, đủ mềm để nhận dạng chữ nghiêng/mờ
