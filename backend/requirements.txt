@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+paddlepaddle
+paddleocr
+Flask-Cors
+pydantic
+vietocr
+torch
+torchvision
+einops
+gdown
