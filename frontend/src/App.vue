@@ -213,7 +213,7 @@ const processImageFile = async (file) => {
     
     const data = await response.json();
     if (data.status === 'success') {
-      console.log(data.text);
+      console.log(data);
       extractedText.value = data.text;
       ocrDetails.value = data.details || [];
       // Dùng kích thước gốc từ server để scale bounding box chính xác
