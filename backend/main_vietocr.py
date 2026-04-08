@@ -58,13 +58,12 @@ def resize_image(img_np: np.ndarray) -> np.ndarray:
     return img_np
 
 def enhance_image(img_np: np.ndarray) -> np.ndarray:
-    # MẸO: Trích xuất kênh Blue để tàng hình các dòng kẻ tập vở màu xanh
-    # và chỉ giữ lại nét mực đen/tím đậm.
-    blue_channel = img_np[:, :, 2]
+    # Chuyển sang grayscale thay vì chỉ dùng kênh Blue để không làm biến mất nét mực xanh nhạt
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
     
-    # Dùng CLAHE tăng mạnh tương phản trên ảnh đã mất dòng kẻ
+    # Dùng CLAHE tăng mạnh tương phản trên ảnh 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(blue_channel)
+    enhanced = clahe.apply(gray)
     
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
 
@@ -100,7 +99,7 @@ async def extract_text(image: UploadFile = File(...)):
         details = []
 
         if det_result and det_result[0]:
-            # RECOGNITION image has natural contrast (no sharpen/CLAHE garbage)
+            # Ảnh thuần RGB giữ nguyên màu sắc, tránh dùng kênh Blue làm mất mực nhạt 
             pil_resized = Image.fromarray(resized_img)
 
             # Thuật toán gom dòng và sắp xếp chính xác:
@@ -127,20 +126,24 @@ async def extract_text(image: UploadFile = File(...)):
 
             lines = []
             if box_data:
-                current_line = [box_data[0]]
-                # 2. Gom thành từng dòng nếu tâm Y của box liền kề lệch nhau không quá nửa chiều cao chữ
-                for i in range(1, len(box_data)):
-                    item = box_data[i]
-                    prev_item = current_line[-1]
-                    avg_height = (item["height"] + prev_item["height"]) / 2
-                    
-                    if abs(item["y_center"] - prev_item["y_center"]) < avg_height * 0.5:
-                        current_line.append(item)
-                    else:
-                        lines.append(current_line)
-                        current_line = [item]
-                if current_line:
-                    lines.append(current_line)
+                # 2. Gom thành từng dòng thay vì nối đuôi theo phần tử liền trước
+                for b in box_data:
+                    placed = False
+                    for line in lines:
+                        line_y_center = sum(item["y_center"] for item in line) / len(line)
+                        line_height = sum(item["height"] for item in line) / len(line)
+                        
+                        # So sánh b["y_center"] với trung bình của toàn dòng
+                        # Giảm ngưỡng từ 0.4 xuống 0.25 để tách các dòng liền nhau ra
+                        if abs(b["y_center"] - line_y_center) < line_height * 0.25:
+                            line.append(b)
+                            placed = True
+                            break
+                    if not placed:
+                        lines.append([b])
+            
+            # Sắp xếp các dòng từ trên xuống dưới theo độ cao trung bình
+            lines.sort(key=lambda l: sum(item["y_center"] for item in l) / len(l))
 
             # 3. Quét từng dòng từ trái qua phải và ghép chữ
             for line in lines:
@@ -165,10 +168,10 @@ async def extract_text(image: UploadFile = File(...)):
                         logger.debug(f"Bỏ qua box vuông/đứng: w={box_w} h={box_h} ratio={box_w/box_h:.2f}")
                         continue
 
-                    # TRÁNH BỎ SÓT: Cắt rộng thêm 1 chút để lấy dấu, nhưng không quá lớn làm nhiễu
-                    pad_x = 3
-                    pad_y_top = 4
-                    pad_y_bottom = 3
+                    # TRÁNH BỎ SÓT: Tăng pad_x lớn để bao gồm trọn các dấu ngoặc ( ) của chữ nghiêng
+                    pad_x = 12
+                    pad_y_top = 8
+                    pad_y_bottom = 5
                     x_min_pad = max(0, x_min - pad_x)
                     y_min_pad = max(0, y_min - pad_y_top)
                     x_max_pad = min(processed_w, x_max + pad_x)
@@ -193,19 +196,20 @@ async def extract_text(image: UploadFile = File(...)):
                         fixed_words.append(w)
                     text = " ".join(fixed_words)
 
-                    # LỌC 2 — CONFIDENCE: Bỏ qua nếu VietOCR không tự tin
-                    # Ngưỡng 0.45 (nếu có): đủ chặt để loại nhiễu, đủ mềm để nhận dạng chữ nghiêng/mờ
-                    if conf is not None and conf < 0.45:
-                        logger.debug(f"Bỏ qua low-conf: '{text}' conf={conf:.3f}")
+                    # LỌC 2 — CONFIDENCE: Bỏ qua nếu VietOCR quá thiếu tự tin 
+                    if conf is not None and conf < 0.15:
                         continue
 
-                    # LỌC 3 — TEXT RÁC: Bỏ qua kết quả ngắn không mang nghĩa tiếng Việt
-                    # Khi VietOCR đọc hình ảnh/biểu đồ → ra ký tự rác như "0", "go", "c", "|"
+                    # LỌC CHỐNG NHIỄU GIẢ: Các vệt dòng kẻ tập trống rỗng thường có w/h rất lớn
+                    # và hay bị VietOCR nhận diện ảo thành "1", "l", "-", "|"
+                    if text in ["1", "l", "I", "|", "!", "-", "'", "`"] and box_h > 0 and (box_w / box_h) > 2.0:
+                        logger.debug(f"Bỏ qua dòng kẻ rác bị nhận thành 1: '{text}' w/h={box_w/box_h:.2f}")
+                        continue
+
+                    # LỌC 3 — TEXT RÁC: Giữ lại dấu câu và chữ số 
                     if len(text) <= 2:
-                        # Chỉ chấp nhận nếu chứa ít nhất 1 chữ cái và không phải ký tự đặc biệt
                         import re as _re
-                        if not _re.search(r'[a-zA-ZÀ-ỹ]', text):
-                            logger.debug(f"Bỏ qua text rác ngắn: '{text}'")
+                        if not _re.search(r'[a-zA-ZÀ-ỹ0-9.,;:!?()\[\]]', text):
                             continue
 
                     if text:
