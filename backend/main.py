@@ -1,6 +1,7 @@
 import os
 import logging
 import io
+import asyncio
 import numpy as np
 import uvicorn
 import cv2
@@ -19,6 +20,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("OCR_SERVER")
 
 models = {}
+ocr_semaphore = asyncio.Semaphore(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -86,13 +88,8 @@ def preprocess_image(img_np: np.ndarray) -> np.ndarray:
     return result
 
 
-@app.post("/api/extract-text")
-async def extract_text(image: UploadFile = File(...)):
-    if "ocr" not in models:
-        return {"status": "error", "message": "Model chưa sẵn sàng."}
-
+def _extract_text_sync(contents: bytes):
     try:
-        contents = await image.read()
         pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
         img_np = np.array(pil_img)
 
@@ -143,6 +140,23 @@ async def extract_text(image: UploadFile = File(...)):
         }
     except Exception as e:
         logger.error(f"Lỗi khi nhận giải mã: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/extract-text")
+async def extract_text(image: UploadFile = File(...)):
+    if "ocr" not in models:
+        return {"status": "error", "message": "Model chưa sẵn sàng."}
+
+    try:
+        contents = await image.read()
+        
+        # Đẩy logic nặng xuống Thread pool chờ Semaphore để không làm treo Server FASTAPI
+        async with ocr_semaphore:
+            result_data = await asyncio.to_thread(_extract_text_sync, contents)
+            
+        return result_data
+    except Exception as e:
+        logger.error(f"Lỗi: {e}")
         return {"status": "error", "message": str(e)}
 
 

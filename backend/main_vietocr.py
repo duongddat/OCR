@@ -1,6 +1,7 @@
 import os
 import logging
 import io
+import asyncio
 import numpy as np
 import uvicorn
 import cv2
@@ -20,6 +21,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger("OCR_SERVER")
 
 models = {}
+ocr_semaphore = asyncio.Semaphore(1)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -68,13 +70,8 @@ def enhance_image(img_np: np.ndarray) -> np.ndarray:
     return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
 
 
-@app.post("/api/extract-text")
-async def extract_text(image: UploadFile = File(...)):
-    if "detector" not in models or "recognizer" not in models:
-        return {"status": "error", "message": "Model chưa sẵn sàng."}
-
+def _extract_text_sync(contents: bytes):
     try:
-        contents = await image.read()
         pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
 
         # FIX EXIF ROTATION: Ảnh chụp từ điện thoại lưu metadata xoay (90°, 270°...)
@@ -241,6 +238,23 @@ async def extract_text(image: UploadFile = File(...)):
             "details": details,
             "imageSize": {"width": original_w, "height": original_h}
         }
+    except Exception as e:
+        logger.error(f"Lỗi: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.post("/api/extract-text")
+async def extract_text(image: UploadFile = File(...)):
+    if "detector" not in models or "recognizer" not in models:
+        return {"status": "error", "message": "Model chưa sẵn sàng."}
+
+    try:
+        contents = await image.read()
+        
+        # Đẩy quá trình xử lý vào Semaphore queue (chỉ 1 file được chạy 1 lúc để chống crash RAM)
+        async with ocr_semaphore:
+            result_data = await asyncio.to_thread(_extract_text_sync, contents)
+            
+        return result_data
     except Exception as e:
         logger.error(f"Lỗi: {e}")
         return {"status": "error", "message": str(e)}
