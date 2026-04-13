@@ -2,19 +2,19 @@ import os
 import logging
 import io
 import asyncio
+import re
 import numpy as np
 import uvicorn
 import cv2
+import torch
 from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image, ImageOps
 
 from vietocr.tool.predictor import Predictor
 from vietocr.tool.config import Cfg
-
-# PaddleOCR chỉ dùng để DETECT vị trí text (nó detect tốt)
-# VietOCR dùng để RECOGNIZE text (nó đọc tiếng Việt tốt hơn nhiều)
 from paddleocr import PaddleOCR
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -23,238 +23,515 @@ logger = logging.getLogger("OCR_SERVER")
 models = {}
 ocr_semaphore = asyncio.Semaphore(1)
 
+_RECOGNITION_WORKERS = int(os.environ.get("OCR_RECOGNITION_WORKERS", "3"))
+_TORCH_TOTAL_THREADS  = torch.get_num_threads()
+_TORCH_PER_WORKER     = max(1, _TORCH_TOTAL_THREADS // _RECOGNITION_WORKERS)
+_DET_LIMIT   = int(os.environ.get("OCR_DET_LIMIT",   "960"))
+_RECOG_LIMIT = int(os.environ.get("OCR_RECOG_LIMIT", "1280"))
+
+_recognition_pool = ThreadPoolExecutor(
+    max_workers=_RECOGNITION_WORKERS,
+    thread_name_prefix="vietocr",
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(">>> ĐANG KHỞI TẠO MODEL...")
     try:
-        # Chỉ dùng PaddleOCR để DETECT (phát hiện vùng chữ)
         models["detector"] = PaddleOCR(
-            use_angle_cls=True,
+            use_angle_cls=False,
             lang='vi',
             device='cpu',
-            det_limit_side_len=1920,
+            det_limit_side_len=_DET_LIMIT,
             det_limit_type='max',
         )
-        # VietOCR để RECOGNIZE (đọc nội dung — hỗ trợ đầy đủ dấu tiếng Việt)
-        config = Cfg.load_config_from_name('vgg_transformer')  # Model tốt nhất
+        config = Cfg.load_config_from_name('vgg_transformer')
         config['cnn']['pretrained'] = True
         config['device'] = 'cpu'
-        config['predictor']['beamsearch'] = True  # BẬT để tăng độ chính xác (đặc biệt với chữ viết tay/chữ có dấu)
+        config['predictor']['beamsearch'] = True
         models["recognizer"] = Predictor(config)
-
+        _warmup_vietocr(models["recognizer"])
         logger.info(">>> KHỞI TẠO THÀNH CÔNG!")
     except Exception as e:
         logger.error(f">>> LỖI: {e}")
     yield
+    _recognition_pool.shutdown(wait=False)
     models.clear()
+
+
+def _warmup_vietocr(recognizer):
+    dummy = Image.fromarray(np.ones((32, 128, 3), dtype=np.uint8) * 200)
+    try:
+        recognizer.predict(dummy, return_prob=True)
+    except Exception:
+        pass
+
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-def resize_image(img_np: np.ndarray) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────────────────────
+# Preprocessing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def resize_to_limit(img_np: np.ndarray, limit: int) -> np.ndarray:
     h, w = img_np.shape[:2]
-    if h < 800 or w < 800:
-        scale = max(800 / h, 800 / w)
-        img_np = cv2.resize(img_np, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-    return img_np
+    longest = max(h, w)
+    if longest == limit:
+        return img_np
+    scale = limit / longest
+    interp = cv2.INTER_LINEAR if scale > 1 else cv2.INTER_AREA
+    return cv2.resize(img_np, (int(w * scale), int(h * scale)), interpolation=interp)
+
 
 def enhance_image(img_np: np.ndarray) -> np.ndarray:
-    # Chuyển sang grayscale thay vì chỉ dùng kênh Blue để không làm biến mất nét mực xanh nhạt
     gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-    
-    # Dùng CLAHE tăng mạnh tương phản trên ảnh 
+    if gray.std() > 55.0:
+        return img_np
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced = clahe.apply(gray)
+    return cv2.cvtColor(clahe.apply(gray), cv2.COLOR_GRAY2RGB)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 1: Vectorized NMS + noise filter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_rect(box_pts) -> tuple[float, float, float, float]:
+    pts = np.array(box_pts)
+    return float(pts[:, 0].min()), float(pts[:, 1].min()), \
+           float(pts[:, 0].max()), float(pts[:, 1].max())
+
+
+def _nms_and_filter_boxes(box_data: list[dict], img_w: int, img_h: int) -> list[dict]:
+    """
+    Sử dụng NumPy Vectorization để tăng tốc NMS thay vì vòng lặp Python thuần.
+    """
+    if not box_data:
+        return []
+
+    img_area = img_w * img_h
+
+    # ── Tính area + rect cho mỗi box ────────────────────────────────────────
+    for b in box_data:
+        r = _get_rect(b["box"])
+        b["_rect"]  = r
+        b["_area"]  = (r[2] - r[0]) * (r[3] - r[1])
+
+    # ── Tầng 1: Lọc tuyệt đối (Box < 0.05% diện tích ảnh) ───────────────────
+    min_abs = img_area * 0.0005
+    box_data = [b for b in box_data if b["_area"] >= min_abs]
+    if not box_data:
+        return []
+
+    # ── Tầng 2: Lọc tương đối (Box < 8% median area) ────────────────────────
+    areas_list = [b["_area"] for b in box_data]
+    median_area = np.median(areas_list)
+    min_rel = median_area * 0.08
+    box_data = [b for b in box_data if b["_area"] >= min_rel]
+    if not box_data:
+        return []
+
+    # ── Tầng 3: NMS Vectorized (NumPy) ──────────────────────────────────────
+    sorted_boxes = sorted(box_data, key=lambda b: b["_area"], reverse=True)
     
-    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2RGB)
+    rects = np.array([b["_rect"] for b in sorted_boxes])
+    areas = np.array([b["_area"] for b in sorted_boxes])
+    
+    keep_indices = []
+    order = np.arange(len(sorted_boxes))
+
+    while order.size > 0:
+        i = order[0]
+        keep_indices.append(i)
+
+        if order.size == 1:
+            break
+
+        xx1 = np.maximum(rects[i, 0], rects[order[1:], 0])
+        yy1 = np.maximum(rects[i, 1], rects[order[1:], 1])
+        xx2 = np.minimum(rects[i, 2], rects[order[1:], 2])
+        yy2 = np.minimum(rects[i, 3], rects[order[1:], 3])
+
+        w = np.maximum(0.0, xx2 - xx1)
+        h = np.maximum(0.0, yy2 - yy1)
+        inter = w * h
+
+        iou = inter / (areas[i] + areas[order[1:]] - inter)
+        ios = inter / areas[order[1:]]
+
+        inds = np.where((iou < 0.40) & (ios < 0.60))[0]
+        order = order[inds + 1]
+
+    result = [sorted_boxes[idx] for idx in keep_indices]
+
+    logger.debug("NMS Vectorized: %d → %d boxes", len(box_data), len(result))
+    return result
 
 
-def _extract_text_sync(contents: bytes):
+# ─────────────────────────────────────────────────────────────────────────────
+# FIX 2: Smart crop bằng NumPy Slicing
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _smart_crop_numpy(img_np: np.ndarray,
+                      x_min: float, y_min: float,
+                      x_max: float, y_max: float,
+                      box_h: float) -> list[Image.Image]:
+    """Cắt ảnh trực tiếp bằng NumPy slicing siêu tốc, sau đó chuyển sang PIL"""
+    h, w = img_np.shape[:2]
+    
+    # Crop 1: padding đầy đủ
+    x1_full = max(0, int(x_min - 12))
+    y1_full = max(0, int(y_min -  8))
+    x2_full = min(w, int(x_max + 12))
+    y2_full = min(h, int(y_max +  5))
+    
+    crops = [Image.fromarray(img_np[y1_full:y2_full, x1_full:x2_full])]
+
+    # Crop 2: bỏ viền ngoài cho chữ lớn
+    if box_h > 40:
+        margin_x = int((x_max - x_min) * 0.08)
+        margin_y = int(box_h * 0.10)
+        x1_tight = max(0, int(x_min + margin_x))
+        y1_tight = max(0, int(y_min + margin_y))
+        x2_tight = min(w, int(x_max - margin_x))
+        y2_tight = min(h, int(y_max - margin_y))
+
+        if x2_tight > x1_tight + 5 and y2_tight > y1_tight + 5:
+            crops.append(Image.fromarray(img_np[y1_tight:y2_tight, x1_tight:x2_tight]))
+
+    return crops
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vectorized line grouping 
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _group_boxes_into_lines(box_data: list[dict]) -> list[list[dict]]:
+    if not box_data:
+        return []
+    y_centers = np.array([b["y_center"] for b in box_data])
+    heights   = np.array([b["height"]   for b in box_data])
+    order     = np.argsort(y_centers, kind='stable')
+    sorted_boxes    = [box_data[i] for i in order]
+    sorted_ycenters = y_centers[order]
+    sorted_heights  = heights[order]
+
+    lines, y_sums, h_sums, counts = [], [], [], []
+    for i, b in enumerate(sorted_boxes):
+        yc, h = sorted_ycenters[i], sorted_heights[i]
+        placed = False
+        for j in range(len(lines)):
+            if abs(yc - y_sums[j] / counts[j]) < (h_sums[j] / counts[j]) * 0.25:
+                lines[j].append(b)
+                y_sums[j] += yc; h_sums[j] += h; counts[j] += 1
+                placed = True
+                break
+        if not placed:
+            lines.append([b]); y_sums.append(yc); h_sums.append(h); counts.append(1)
+
+    means = [y_sums[j] / counts[j] for j in range(len(lines))]
+    return [lines[j] for j in np.argsort(means, kind='stable')]
+
+
+def _prepare_valid_crops(
+    lines, recog_img_np, det_w, det_h, recog_w, recog_h, sx_d2r, sy_d2r
+) -> list[dict]:
+    valid = []
+    for line_idx, line in enumerate(lines):
+        for box_idx, item in enumerate(sorted(line, key=lambda x: x["x_min"])):
+            box = item["box"]
+            pts = np.array(box, dtype=np.float32)
+
+            x_min_d = max(0.0, pts[:, 0].min())
+            y_min_d = max(0.0, pts[:, 1].min())
+            x_max_d = min(float(det_w), pts[:, 0].max())
+            y_max_d = min(float(det_h), pts[:, 1].max())
+
+            bw = x_max_d - x_min_d
+            bh = y_max_d - y_min_d
+            if bh <= 0 or bw <= 0 or (bw / bh) < 1.2:
+                continue
+
+            x_min_r = x_min_d * sx_d2r
+            y_min_r = y_min_d * sy_d2r
+            x_max_r = x_max_d * sx_d2r
+            y_max_r = y_max_d * sy_d2r
+            bh_r    = bh * sy_d2r
+
+            crops = _smart_crop_numpy(
+                recog_img_np,
+                x_min_r, y_min_r, x_max_r, y_max_r,
+                bh_r
+            )
+
+            valid.append({
+                "crops":    crops,
+                "box":      box,
+                "line_idx": line_idx,
+                "box_idx":  box_idx,
+                "box_w":    int(bw),
+                "box_h":    int(bh),
+            })
+    return valid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Batch VietOCR (Tối ưu tạo Tensor)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _batch_vietocr_predict(crops: list[Image.Image]) -> list[tuple[str, float]]:
+    recognizer = models["recognizer"]
+    if not crops:
+        return []
+    if len(crops) == 1:
+        t, c = recognizer.predict(crops[0], return_prob=True)
+        return [(t.strip(), float(c) if c else 1.0)]
+    try:
+        model = recognizer.model
+        transform = recognizer.transformers
+
+        tensors = [transform(c) for c in crops]
+        max_w = max(t.shape[2] for t in tensors)
+        
+        # Hardcode C=3, H=32 (kiến trúc vgg_transformer)
+        batch = torch.zeros(len(tensors), 3, 32, max_w)
+        for i, t in enumerate(tensors):
+            batch[i, :, :, :t.shape[2]] = t
+
+        with torch.inference_mode():
+            src_batch = model.cnn(batch)
+
+        results = []
+        for i in range(len(crops)):
+            src_i = src_batch[i:i+1]
+            with torch.inference_mode():
+                if recognizer.config['predictor']['beamsearch']:
+                    sent = model.beamsearch(src_i)
+                    text = recognizer.vocab.decode(sent)
+                    prob = 1.0
+                else:
+                    s, prob = model.translate(src_i)
+                    text = recognizer.vocab.decode(s[0].tolist())
+                    prob = float(prob) if prob is not None else 1.0
+            results.append((text.strip(), prob))
+        return results
+    except Exception as e:
+        logger.debug("Batch CNN fallback sequential: %s", e)
+        out = []
+        for c in crops:
+            t, conf = recognizer.predict(c, return_prob=True)
+            out.append((t.strip(), float(conf) if conf else 1.0))
+        return out
+
+
+def _recognize_chunk(crops_chunk: list[Image.Image]) -> list[tuple[str, float]]:
+    torch.set_num_threads(_TORCH_PER_WORKER)
+    return _batch_vietocr_predict(crops_chunk)
+
+
+def _run_parallel_chunked_recognition(valid_crops: list[dict]) -> list[tuple[str, float]]:
+    if not valid_crops:
+        return []
+
+    all_crops   = []
+    item_ranges = []
+    for item in valid_crops:
+        start = len(all_crops)
+        all_crops.extend(item["crops"])
+        item_ranges.append((start, len(all_crops)))
+
+    n = len(all_crops)
+    if n <= 5:
+        all_results = _batch_vietocr_predict(all_crops)
+    else:
+        chunk_size   = max(1, -(-n // _RECOGNITION_WORKERS))
+        chunks       = [all_crops[i:i+chunk_size] for i in range(0, n, chunk_size)]
+        futures      = {
+            _recognition_pool.submit(_recognize_chunk, chunk): idx
+            for idx, chunk in enumerate(chunks)
+        }
+        flat_chunks  = [None] * len(chunks)
+        for future in as_completed(futures):
+            chunk_idx = futures[future]
+            try:
+                flat_chunks[chunk_idx] = future.result()
+            except Exception as e:
+                logger.warning("Chunk %d failed: %s", chunk_idx, e)
+                flat_chunks[chunk_idx] = [("", 0.0)] * len(chunks[chunk_idx])
+        all_results = [r for chunk in flat_chunks for r in chunk]
+
+    best_results = []
+    for start, end in item_ranges:
+        candidates = all_results[start:end]
+        best = max(candidates, key=lambda x: x[1])
+        best_results.append(best)
+
+    return best_results
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Lọc ngưỡng confidence 
+# ─────────────────────────────────────────────────────────────────────────────
+
+_NOISE_CHARS = frozenset(["1", "l", "I", "|", "!", "-", "'", "`"])
+
+def _fix_mixed_case(text: str) -> str:
+    fixed = []
+    for w in text.split():
+        alphas = [c for c in w if c.isalpha()]
+        if len(alphas) >= 2:
+            uppers = sum(1 for c in alphas if c.isupper())
+            if uppers >= 2 and uppers >= len(alphas) / 2:
+                fixed.append(w.upper()); continue
+        fixed.append(w)
+    return " ".join(fixed)
+
+
+def _is_valid_text(text: str, box_w: int, box_h: int, conf: float) -> bool:
+    text_len = len(text)
+
+    if text_len == 1 and text.isalpha() and text.isupper():
+        if conf < 0.70:
+            return False
+    elif text_len <= 2:
+        if conf < 0.40:
+            return False
+        if not re.search(r'[a-zA-ZÀ-ỹ0-9.,;:!?()\[\]]', text):
+            return False
+    else:
+        if conf < 0.15:
+            return False
+
+    if text in _NOISE_CHARS and box_h > 0 and (box_w / box_h) > 2.0:
+        return False
+
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main sync function
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_text_sync(contents: bytes) -> dict:
     try:
         pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-
-        # FIX EXIF ROTATION: Ảnh chụp từ điện thoại lưu metadata xoay (90°, 270°...)
-        # PIL mặc định KHÔNG đọc EXIF → ảnh bị nằm ngang khi xử lý → OCR thất bại
-        # exif_transpose() tự động xoay đúng hướng theo EXIF trước khi xử lý
         pil_img = ImageOps.exif_transpose(pil_img)
 
         img_np = np.array(pil_img)
         original_h, original_w = img_np.shape[:2]
 
-        resized_img = resize_image(img_np.copy())
-        processed_img = enhance_image(resized_img.copy())
-        
-        processed_h, processed_w = processed_img.shape[:2]
-        scale_x = original_w / processed_w
-        scale_y = original_h / processed_h
+        det_img  = resize_to_limit(img_np, _DET_LIMIT)
+        det_img  = enhance_image(det_img)
+        det_h, det_w = det_img.shape[:2]
 
-        # Bước 1: Dùng PaddleOCR chỉ để DETECT vùng chữ
-        det_result = models["detector"].ocr(processed_img, rec=False, cls=False)
+        recog_img = resize_to_limit(img_np, _RECOG_LIMIT)
+        recog_h, recog_w = recog_img.shape[:2]
 
-        full_text = ""
+        sx_d2r = recog_w / det_w
+        sy_d2r = recog_h / det_h
+        sx_d2o = original_w / det_w
+        sy_d2o = original_h / det_h
+
+        # ── PHASE 1: Detection ───────────────────────────────────────────────
+        det_result = models["detector"].ocr(det_img, rec=False, cls=False)
+
+        if not det_result or not det_result[0]:
+            return {"status": "success", "text": "", "details": [],
+                    "imageSize": {"width": original_w, "height": original_h}}
+
+        # ── PHASE 2: Box metadata ────────────────────────────────────────────
+        raw_boxes = det_result[0]
+        box_data  = []
+        for b in raw_boxes:
+            pts   = np.array(b)
+            y_min = pts[:, 1].min(); y_max = pts[:, 1].max()
+            box_data.append({
+                "box":      b,
+                "y_center": (y_min + y_max) / 2,
+                "x_min":    pts[:, 0].min(),
+                "y_min":    y_min,
+                "height":   y_max - y_min,
+            })
+
+        logger.info("PaddleOCR raw: %d boxes", len(box_data))
+
+        # ── PHASE 2.5: NMS + noise filter (FIX 1) ───────────────────────────
+        box_data = _nms_and_filter_boxes(box_data, det_w, det_h)
+        logger.info("After NMS: %d boxes", len(box_data))
+
+        if not box_data:
+            return {"status": "success", "text": "", "details": [],
+                    "imageSize": {"width": original_w, "height": original_h}}
+
+        # ── PHASE 3: Line grouping ───────────────────────────────────────────
+        lines = _group_boxes_into_lines(box_data)
+
+        # ── PHASE 4: Smart crop (FIX 2) ─────────────────────────────────────
+        valid_crops = _prepare_valid_crops(
+            lines, recog_img, 
+            det_w, det_h, recog_w, recog_h,
+            sx_d2r, sy_d2r,
+        )
+
+        if not valid_crops:
+            return {"status": "success", "text": "", "details": [],
+                    "imageSize": {"width": original_w, "height": original_h}}
+
+        # ── PHASE 5: Parallel batch recognition ─────────────────────────────
+        recog_results = _run_parallel_chunked_recognition(valid_crops)
+
+        # ── PHASE 6: Post-process (FIX 3) ───────────────────────────────────
+        line_texts: dict[int, list[tuple[int, str]]] = {}
         details = []
 
-        if det_result and det_result[0]:
-            # Ảnh thuần RGB giữ nguyên màu sắc, tránh dùng kênh Blue làm mất mực nhạt 
-            pil_resized = Image.fromarray(resized_img)
+        for item, (raw_text, conf) in zip(valid_crops, recog_results):
+            if not raw_text:
+                continue
+            text = _fix_mixed_case(raw_text)
+            if not _is_valid_text(text, item["box_w"], item["box_h"], conf):
+                continue
 
-            # Thuật toán gom dòng và sắp xếp chính xác:
-            boxes = det_result[0]
-            box_data = []
-            for b in boxes:
-                pts = np.array(b)
-                y_min = pts[:, 1].min()
-                y_max = pts[:, 1].max()
-                x_min = pts[:, 0].min()
-                x_max = pts[:, 0].max()
-                y_center = (y_min + y_max) / 2
-                height = y_max - y_min
-                box_data.append({
-                    "box": b,
-                    "y_center": y_center,
-                    "x_min": x_min,
-                    "y_min": y_min,
-                    "height": height
-                })
+            line_idx = item["line_idx"]
+            line_texts.setdefault(line_idx, []).append((item["box_idx"], text))
 
-            # 1. Sắp xếp sơ bộ từ trên xuống dưới theo tâm Y
-            box_data.sort(key=lambda x: x["y_center"])
+            original_box = [
+                [int(pt[0] * sx_d2o), int(pt[1] * sy_d2o)]
+                for pt in item["box"]
+            ]
+            details.append({"box": original_box, "text": text, "confidence": conf})
 
-            lines = []
-            if box_data:
-                # 2. Gom thành từng dòng thay vì nối đuôi theo phần tử liền trước
-                for b in box_data:
-                    placed = False
-                    for line in lines:
-                        line_y_center = sum(item["y_center"] for item in line) / len(line)
-                        line_height = sum(item["height"] for item in line) / len(line)
-                        
-                        # So sánh b["y_center"] với trung bình của toàn dòng
-                        # Giảm ngưỡng từ 0.4 xuống 0.25 để tách các dòng liền nhau ra
-                        if abs(b["y_center"] - line_y_center) < line_height * 0.25:
-                            line.append(b)
-                            placed = True
-                            break
-                    if not placed:
-                        lines.append([b])
-            
-            # Sắp xếp các dòng từ trên xuống dưới theo độ cao trung bình
-            lines.sort(key=lambda l: sum(item["y_center"] for item in l) / len(l))
+        full_text = ""
+        for line_idx in sorted(line_texts.keys()):
+            tokens = sorted(line_texts[line_idx], key=lambda x: x[0])
+            line_str = " ".join(t for _, t in tokens)
+            if line_str:
+                full_text += line_str + "\n"
 
-            # 3. Quét từng dòng từ trái qua phải và ghép chữ
-            for line in lines:
-                line.sort(key=lambda x: x["x_min"])
-                
-                line_text = ""
-                for item in line:
-                    box = item["box"]
-                    pts = np.array(box, dtype=np.int32)
-                    x_min = max(0, pts[:, 0].min())
-                    y_min = max(0, pts[:, 1].min())
-                    x_max = min(processed_w, pts[:, 0].max())
-                    y_max = min(processed_h, pts[:, 1].max())
-
-                    box_w = x_max - x_min
-                    box_h = y_max - y_min
-
-                    # LỌC 1 — ASPECT RATIO: Bỏ qua box gần vuông/cao hơn rộng
-                    # Vùng chữ thật luôn rộng hơn cao (tỉ lệ ngang).
-                    # Box gần vuông hoặc cao hơn rộng = hình ảnh, icon, logo → bỏ qua
-                    if box_h > 0 and (box_w / box_h) < 1.2:
-                        logger.debug(f"Bỏ qua box vuông/đứng: w={box_w} h={box_h} ratio={box_w/box_h:.2f}")
-                        continue
-
-                    # TRÁNH BỎ SÓT: Tăng pad_x lớn để bao gồm trọn các dấu ngoặc ( ) của chữ nghiêng
-                    pad_x = 12
-                    pad_y_top = 8
-                    pad_y_bottom = 5
-                    x_min_pad = max(0, x_min - pad_x)
-                    y_min_pad = max(0, y_min - pad_y_top)
-                    x_max_pad = min(processed_w, x_max + pad_x)
-                    y_max_pad = min(processed_h, y_max + pad_y_bottom)
-
-                    cropped = pil_resized.crop((x_min_pad, y_min_pad, x_max_pad, y_max_pad))
-
-                    # Bước 2: Nhận diện với VietOCR
-                    text, conf = models["recognizer"].predict(cropped, return_prob=True)
-                    text = text.strip()
-                    
-                    # FIX: VietOCR hay bị lỗi trộn chữ HOA với dấu thường (VD: "NGHIệP NGHèO")
-                    # Nếu một từ có phần lớn là in hoa, ta sẽ ép nó thành in hoa chuẩn (VD: NGHIỆP NGHÈO)
-                    fixed_words = []
-                    for w in text.split():
-                        alphas = [c for c in w if c.isalpha()]
-                        if len(alphas) >= 2:
-                            uppers = sum(1 for c in alphas if c.isupper())
-                            if uppers >= 2 and uppers >= len(alphas) / 2:
-                                fixed_words.append(w.upper())
-                                continue
-                        fixed_words.append(w)
-                    text = " ".join(fixed_words)
-
-                    # LỌC 2 — CONFIDENCE: Bỏ qua nếu VietOCR quá thiếu tự tin 
-                    if conf is not None and conf < 0.15:
-                        continue
-
-                    # LỌC CHỐNG NHIỄU GIẢ: Các vệt dòng kẻ tập trống rỗng thường có w/h rất lớn
-                    # và hay bị VietOCR nhận diện ảo thành "1", "l", "-", "|"
-                    if text in ["1", "l", "I", "|", "!", "-", "'", "`"] and box_h > 0 and (box_w / box_h) > 2.0:
-                        logger.debug(f"Bỏ qua dòng kẻ rác bị nhận thành 1: '{text}' w/h={box_w/box_h:.2f}")
-                        continue
-
-                    # LỌC 3 — TEXT RÁC: Giữ lại dấu câu và chữ số 
-                    if len(text) <= 2:
-                        import re as _re
-                        if not _re.search(r'[a-zA-ZÀ-ỹ0-9.,;:!?()\[\]]', text):
-                            continue
-
-                    if text:
-                        # Gom khoảng trắng với các cụm trong cùng dòng
-                        if line_text:
-                            line_text += " " + text
-                        else:
-                            line_text = text
-
-                        # Original box coordinate mapping
-                        original_box = [
-                            [int(pt[0] * scale_x), int(pt[1] * scale_y)]
-                            for pt in box
-                        ]
-                        details.append({
-                            "box": original_box,
-                            "text": text,
-                            "confidence": float(conf) if conf is not None else 1.0
-                        })
-
-                if line_text:
-                    full_text += line_text + "\n"
-
-        logger.info(f"Nhận diện được {len(details)} từ/cụm cụm.")
+        logger.info("Kết quả: %d cụm chữ hợp lệ", len(details))
 
         return {
-            "status": "success",
-            "text": full_text.strip(),
-            "details": details,
-            "imageSize": {"width": original_w, "height": original_h}
+            "status":    "success",
+            "text":      full_text.strip(),
+            "details":   details,
+            "imageSize": {"width": original_w, "height": original_h},
         }
+
     except Exception as e:
-        logger.error(f"Lỗi: {e}")
+        logger.error(f"Lỗi: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
+
 
 @app.post("/api/extract-text")
 async def extract_text(image: UploadFile = File(...)):
     if "detector" not in models or "recognizer" not in models:
         return {"status": "error", "message": "Model chưa sẵn sàng."}
-
     try:
         contents = await image.read()
-        
-        # Đẩy quá trình xử lý vào Semaphore queue (chỉ 1 file được chạy 1 lúc để chống crash RAM)
         async with ocr_semaphore:
-            result_data = await asyncio.to_thread(_extract_text_sync, contents)
-            
-        return result_data
+            result = await asyncio.to_thread(_extract_text_sync, contents)
+        return result
     except Exception as e:
         logger.error(f"Lỗi: {e}")
         return {"status": "error", "message": str(e)}
