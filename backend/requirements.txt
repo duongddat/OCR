@@ -16,3 +16,4 @@ requests
 uvicorn
 scikit-image
 scikit-learn
+pymupdf

@@ -3,6 +3,7 @@ import logging
 import io
 import asyncio
 import re
+import fitz  # PyMuPDF
 import numpy as np
 import uvicorn
 import cv2
@@ -49,7 +50,7 @@ async def lifespan(app: FastAPI):
         config = Cfg.load_config_from_name('vgg_transformer')
         config['cnn']['pretrained'] = True
         config['device'] = 'cpu'
-        config['predictor']['beamsearch'] = True
+        config['predictor']['beamsearch'] = False
         models["recognizer"] = Predictor(config)
         _warmup_vietocr(models["recognizer"])
         logger.info(">>> KHỞI TẠO THÀNH CÔNG!")
@@ -95,7 +96,7 @@ def enhance_image(img_np: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 1: Vectorized NMS + noise filter
+# NMS + noise filter
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_rect(box_pts) -> tuple[float, float, float, float]:
@@ -105,27 +106,21 @@ def _get_rect(box_pts) -> tuple[float, float, float, float]:
 
 
 def _nms_and_filter_boxes(box_data: list[dict], img_w: int, img_h: int) -> list[dict]:
-    """
-    Sử dụng NumPy Vectorization để tăng tốc NMS thay vì vòng lặp Python thuần.
-    """
     if not box_data:
         return []
 
     img_area = img_w * img_h
 
-    # ── Tính area + rect cho mỗi box ────────────────────────────────────────
     for b in box_data:
         r = _get_rect(b["box"])
         b["_rect"]  = r
         b["_area"]  = (r[2] - r[0]) * (r[3] - r[1])
 
-    # ── Tầng 1: Lọc tuyệt đối (Box < 0.05% diện tích ảnh) ───────────────────
     min_abs = img_area * 0.0005
     box_data = [b for b in box_data if b["_area"] >= min_abs]
     if not box_data:
         return []
 
-    # ── Tầng 2: Lọc tương đối (Box < 8% median area) ────────────────────────
     areas_list = [b["_area"] for b in box_data]
     median_area = np.median(areas_list)
     min_rel = median_area * 0.08
@@ -133,12 +128,11 @@ def _nms_and_filter_boxes(box_data: list[dict], img_w: int, img_h: int) -> list[
     if not box_data:
         return []
 
-    # ── Tầng 3: NMS Vectorized (NumPy) ──────────────────────────────────────
     sorted_boxes = sorted(box_data, key=lambda b: b["_area"], reverse=True)
-    
+
     rects = np.array([b["_rect"] for b in sorted_boxes])
     areas = np.array([b["_area"] for b in sorted_boxes])
-    
+
     keep_indices = []
     order = np.arange(len(sorted_boxes))
 
@@ -165,31 +159,27 @@ def _nms_and_filter_boxes(box_data: list[dict], img_w: int, img_h: int) -> list[
         order = order[inds + 1]
 
     result = [sorted_boxes[idx] for idx in keep_indices]
-
     logger.debug("NMS Vectorized: %d → %d boxes", len(box_data), len(result))
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIX 2: Smart crop bằng NumPy Slicing
+# Smart crop
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _smart_crop_numpy(img_np: np.ndarray,
                       x_min: float, y_min: float,
                       x_max: float, y_max: float,
                       box_h: float) -> list[Image.Image]:
-    """Cắt ảnh trực tiếp bằng NumPy slicing siêu tốc, sau đó chuyển sang PIL"""
     h, w = img_np.shape[:2]
-    
-    # Crop 1: padding đầy đủ
+
     x1_full = max(0, int(x_min - 12))
     y1_full = max(0, int(y_min -  8))
     x2_full = min(w, int(x_max + 12))
     y2_full = min(h, int(y_max +  5))
-    
+
     crops = [Image.fromarray(img_np[y1_full:y2_full, x1_full:x2_full])]
 
-    # Crop 2: bỏ viền ngoài cho chữ lớn
     if box_h > 40:
         margin_x = int((x_max - x_min) * 0.08)
         margin_y = int(box_h * 0.10)
@@ -205,7 +195,7 @@ def _smart_crop_numpy(img_np: np.ndarray,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vectorized line grouping 
+# Line grouping
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _group_boxes_into_lines(box_data: list[dict]) -> list[list[dict]]:
@@ -278,7 +268,7 @@ def _prepare_valid_crops(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Batch VietOCR (Tối ưu tạo Tensor)
+# Batch VietOCR
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _batch_vietocr_predict(crops: list[Image.Image]) -> list[tuple[str, float]]:
@@ -294,8 +284,7 @@ def _batch_vietocr_predict(crops: list[Image.Image]) -> list[tuple[str, float]]:
 
         tensors = [transform(c) for c in crops]
         max_w = max(t.shape[2] for t in tensors)
-        
-        # Hardcode C=3, H=32 (kiến trúc vgg_transformer)
+
         batch = torch.zeros(len(tensors), 3, 32, max_w)
         for i, t in enumerate(tensors):
             batch[i, :, :, :t.shape[2]] = t
@@ -346,13 +335,13 @@ def _run_parallel_chunked_recognition(valid_crops: list[dict]) -> list[tuple[str
     if n <= 5:
         all_results = _batch_vietocr_predict(all_crops)
     else:
-        chunk_size   = max(1, -(-n // _RECOGNITION_WORKERS))
-        chunks       = [all_crops[i:i+chunk_size] for i in range(0, n, chunk_size)]
-        futures      = {
+        chunk_size  = max(1, -(-n // _RECOGNITION_WORKERS))
+        chunks      = [all_crops[i:i+chunk_size] for i in range(0, n, chunk_size)]
+        futures     = {
             _recognition_pool.submit(_recognize_chunk, chunk): idx
             for idx, chunk in enumerate(chunks)
         }
-        flat_chunks  = [None] * len(chunks)
+        flat_chunks = [None] * len(chunks)
         for future in as_completed(futures):
             chunk_idx = futures[future]
             try:
@@ -372,10 +361,11 @@ def _run_parallel_chunked_recognition(valid_crops: list[dict]) -> list[tuple[str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lọc ngưỡng confidence 
+# Confidence filter
 # ─────────────────────────────────────────────────────────────────────────────
 
 _NOISE_CHARS = frozenset(["1", "l", "I", "|", "!", "-", "'", "`"])
+
 
 def _fix_mixed_case(text: str) -> str:
     fixed = []
@@ -411,15 +401,15 @@ def _is_valid_text(text: str, box_w: int, box_h: int, conf: float) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main sync function
+# Core pipeline — nhận numpy array (dùng chung cho ảnh và PDF)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _extract_text_sync(contents: bytes) -> dict:
+def _extract_text_from_numpy(img_np: np.ndarray) -> dict:
+    """
+    Pipeline OCR hoàn chỉnh từ numpy array RGB uint8.
+    Tách ra để PDF có thể gọi trực tiếp, tránh encode/decode PNG thừa.
+    """
     try:
-        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
-        pil_img = ImageOps.exif_transpose(pil_img)
-
-        img_np = np.array(pil_img)
         original_h, original_w = img_np.shape[:2]
 
         det_img  = resize_to_limit(img_np, _DET_LIMIT)
@@ -457,7 +447,7 @@ def _extract_text_sync(contents: bytes) -> dict:
 
         logger.info("PaddleOCR raw: %d boxes", len(box_data))
 
-        # ── PHASE 2.5: NMS + noise filter (FIX 1) ───────────────────────────
+        # ── PHASE 2.5: NMS + noise filter ───────────────────────────────────
         box_data = _nms_and_filter_boxes(box_data, det_w, det_h)
         logger.info("After NMS: %d boxes", len(box_data))
 
@@ -468,9 +458,9 @@ def _extract_text_sync(contents: bytes) -> dict:
         # ── PHASE 3: Line grouping ───────────────────────────────────────────
         lines = _group_boxes_into_lines(box_data)
 
-        # ── PHASE 4: Smart crop (FIX 2) ─────────────────────────────────────
+        # ── PHASE 4: Smart crop ──────────────────────────────────────────────
         valid_crops = _prepare_valid_crops(
-            lines, recog_img, 
+            lines, recog_img,
             det_w, det_h, recog_w, recog_h,
             sx_d2r, sy_d2r,
         )
@@ -482,7 +472,7 @@ def _extract_text_sync(contents: bytes) -> dict:
         # ── PHASE 5: Parallel batch recognition ─────────────────────────────
         recog_results = _run_parallel_chunked_recognition(valid_crops)
 
-        # ── PHASE 6: Post-process (FIX 3) ───────────────────────────────────
+        # ── PHASE 6: Post-process ────────────────────────────────────────────
         line_texts: dict[int, list[tuple[int, str]]] = {}
         details = []
 
@@ -523,14 +513,102 @@ def _extract_text_sync(contents: bytes) -> dict:
         return {"status": "error", "message": str(e)}
 
 
+def _extract_text_sync(contents: bytes) -> dict:
+    """Decode bytes → numpy RGB, sau đó chạy pipeline chung."""
+    try:
+        pil_img = Image.open(io.BytesIO(contents)).convert("RGB")
+        pil_img = ImageOps.exif_transpose(pil_img)
+        img_np  = np.array(pil_img)
+    except Exception as e:
+        logger.error(f"Lỗi đọc ảnh: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+    return _extract_text_from_numpy(img_np)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF Processing — gọi thẳng _extract_text_from_numpy, không qua bytes
+# ─────────────────────────────────────────────────────────────────────────────
+
+_PDF_MAX_PAGES = int(os.environ.get("OCR_PDF_MAX_PAGES", "10"))
+_PDF_DPI       = int(os.environ.get("OCR_PDF_DPI", "200"))
+
+# Ma trận scale một lần, tránh tạo lại mỗi trang
+_PDF_MAT = fitz.Matrix(_PDF_DPI / 72, _PDF_DPI / 72)
+
+
+def _extract_text_from_pdf_sync(contents: bytes) -> dict:
+    """
+    Render từng trang PDF → numpy array → OCR.
+    Khác bản cũ: bỏ bước PIL→PNG encode/decode thừa (~30–80ms/trang).
+    """
+    try:
+        pdf = fitz.open(stream=contents, filetype="pdf")
+        total_pages = min(len(pdf), _PDF_MAX_PAGES)
+        if total_pages == 0:
+            pdf.close()
+            return {"status": "success", "text": "", "details": [], "pages": 0}
+
+        all_text    = []
+        all_details = []
+        pdf_preview_base64 = None
+
+        for page_num in range(total_pages):
+            page = pdf[page_num]
+            pix  = page.get_pixmap(matrix=_PDF_MAT, colorspace=fitz.csRGB, alpha=False)
+
+            # ── THAY ĐỔI: numpy trực tiếp, không encode PNG ─────────────────
+            # .copy() bắt buộc vì pix.samples là buffer tạm của fitz,
+            # sẽ bị giải phóng khi pix ra khỏi scope.
+            img_np = np.frombuffer(pix.samples, dtype=np.uint8) \
+                       .reshape(pix.height, pix.width, 3) \
+                       .copy()
+            pix = None  # giải phóng sớm, tránh giữ buffer của fitz
+
+            if page_num == 0:
+                import base64
+                img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+                _, buffer = cv2.imencode('.jpg', img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+                pdf_preview_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            page_result = _extract_text_from_numpy(img_np)
+
+            if page_result.get("status") == "success":
+                page_text = page_result.get("text", "").strip()
+                if page_text:
+                    all_text.append(f"--- Trang {page_num + 1} ---\n{page_text}")
+                all_details.extend(page_result.get("details", []))
+
+        pdf.close()
+
+        return {
+            "status":  "success",
+            "text":    "\n\n".join(all_text),
+            "details": all_details,
+            "pages":   total_pages,
+            "pdfPreviewBase64": pdf_preview_base64,
+        }
+    except Exception as e:
+        logger.error(f"Lỗi PDF: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+
 @app.post("/api/extract-text")
-async def extract_text(image: UploadFile = File(...)):
+async def extract_text(file: UploadFile = File(...)):
     if "detector" not in models or "recognizer" not in models:
         return {"status": "error", "message": "Model chưa sẵn sàng."}
     try:
-        contents = await image.read()
-        async with ocr_semaphore:
-            result = await asyncio.to_thread(_extract_text_sync, contents)
+        contents     = await file.read()
+        content_type = (file.content_type or "").lower()
+        filename     = (file.filename    or "").lower()
+        is_pdf       = "pdf" in content_type or filename.endswith(".pdf")
+
+        if is_pdf:
+            logger.info("Nhận file PDF: %s", file.filename)
+            result = await asyncio.to_thread(_extract_text_from_pdf_sync, contents)
+        else:
+            async with ocr_semaphore:
+                result = await asyncio.to_thread(_extract_text_sync, contents)
         return result
     except Exception as e:
         logger.error(f"Lỗi: {e}")

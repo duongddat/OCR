@@ -23,9 +23,9 @@
         </div>
 
         <div class="camera-controls glass">
-          <button @click="triggerFileUpload" class="control-btn" aria-label="Chọn ảnh">
+          <button @click="triggerFileUpload" class="control-btn" aria-label="Chọn ảnh hoặc PDF">
             <span class="material-icons-round">photo_library</span>
-            <input type="file" ref="fileInput" @change="handleFileUpload" accept="image/*" class="hidden">
+            <input type="file" ref="fileInput" @change="handleFileUpload" accept="image/*,application/pdf" class="hidden">
           </button>
           
           <button @click="capturePhoto" class="capture-button" aria-label="Chụp ảnh">
@@ -57,18 +57,26 @@
         <div class="result-container">
           <div class="result-columns">
             <div class="preview-box glass-card">
-              <img :src="capturedPhoto" alt="Tài liệu đã quét">
-              
-              <!-- Bounding Boxes overlay -->
-              <div class="bbox-container">
-                <div 
-                  v-for="(detail, i) in ocrDetails" 
-                  :key="i"
-                  class="bbox"
-                  :style="getBBoxStyle(detail.box)"
-                  :title="`Text: ${detail.text} | Confidence: ${(detail.confidence*100).toFixed(1)}%`"
-                ></div>
+              <!-- Preview PDF -->
+              <div v-if="isPdf && !capturedPhoto" class="pdf-preview">
+                <span class="material-icons-round pdf-icon">picture_as_pdf</span>
+                <p class="pdf-name">{{ pdfFileName }}</p>
+                <span v-if="totalPages > 0" class="pdf-badge">{{ totalPages }} trang đã xử lý</span>
               </div>
+              <!-- Preview Image -->
+              <template v-else>
+                <img :src="capturedPhoto" alt="Tài liệu đã quét">
+                <!-- Bounding Boxes overlay -->
+                <div v-if="!isPdf" class="bbox-container">
+                  <div 
+                    v-for="(detail, i) in ocrDetails" 
+                    :key="i"
+                    class="bbox"
+                    :style="getBBoxStyle(detail.box)"
+                    :title="`Text: ${detail.text} | Confidence: ${(detail.confidence*100).toFixed(1)}%`"
+                  ></div>
+                </div>
+              </template>
             </div>
             
             <div class="text-box glass-card">
@@ -117,6 +125,9 @@ const facingMode = ref('environment'); // environment (back) or user (front)
 const capturedPhoto = ref(null); // Data URL of the picture
 const extractedText = ref('');
 const ocrDetails = ref([]);
+const isPdf = ref(false);
+const pdfFileName = ref('');
+const totalPages = ref(0);
 
 // UI / Elements refs
 const videoElement = ref(null);
@@ -175,19 +186,27 @@ const triggerFileUpload = () => {
 };
 
 const processImageFile = async (file) => {
-  // Preview
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    capturedPhoto.value = e.target.result;
-    
-    // Load image to get original dimensions for bbox scaling
-    const img = new Image();
-    img.onload = () => {
-      imageActualSize.value = { width: img.width, height: img.height };
+  const fileIsPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+  isPdf.value = fileIsPdf;
+  pdfFileName.value = file.name;
+  totalPages.value = 0;
+
+  if (!fileIsPdf) {
+    // Preview ảnh
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      capturedPhoto.value = e.target.result;
+      const img = new Image();
+      img.onload = () => {
+        imageActualSize.value = { width: img.width, height: img.height };
+      };
+      img.src = e.target.result;
     };
-    img.src = e.target.result;
-  };
-  reader.readAsDataURL(file);
+    reader.readAsDataURL(file);
+  } else {
+    // PDF: dùng icon thay vì ảnh preview
+    capturedPhoto.value = null;
+  }
 
   // Stop camera
   if (stream.value) {
@@ -195,15 +214,12 @@ const processImageFile = async (file) => {
   }
 
   appState.value = 'loading';
-  
-  // Create FormData
-  const formData = new FormData();
-  formData.append('image', file);
 
-  // Send request to FastAPI
+  // Create FormData — dùng field name 'file' để backend nhận đúng
+  const formData = new FormData();
+  formData.append('file', file);
+
   try {
-    // Lấy URL của Backend từ file .env (VD: http://localhost:8000)
-    // Nếu deploy mà không cấu hình, nó sẽ tự động chạy thư mục tương đối (relative path)
     const baseUrl = import.meta.env.VITE_API_URL || '';
     const endpoint = `${baseUrl}/api/extract-text`;
     const response = await fetch(endpoint, {
@@ -213,15 +229,17 @@ const processImageFile = async (file) => {
     
     const data = await response.json();
     if (data.status === 'success') {
-      console.log(data);
       extractedText.value = data.text;
       ocrDetails.value = data.details || [];
-      // Dùng kích thước gốc từ server để scale bounding box chính xác
+      if (data.pages) totalPages.value = data.pages;
+      if (data.pdfPreviewBase64) {
+        capturedPhoto.value = `data:image/jpeg;base64,${data.pdfPreviewBase64}`;
+      }
       if (data.imageSize) {
         imageActualSize.value = { width: data.imageSize.width, height: data.imageSize.height };
       }
     } else {
-      extractedText.value = "Lỗi server: " + (data.message || "Unknown error");
+      extractedText.value = 'Lỗi server: ' + (data.message || 'Unknown error');
     }
   } catch (err) {
     console.error(err);
@@ -273,6 +291,9 @@ const resetScanner = () => {
   capturedPhoto.value = null;
   extractedText.value = '';
   ocrDetails.value = [];
+  isPdf.value = false;
+  pdfFileName.value = '';
+  totalPages.value = 0;
   appState.value = 'scanning';
   startCamera();
 };
@@ -726,5 +747,45 @@ textarea:focus {
   color: var(--success);
   font-size: 24px;
   filter: drop-shadow(0 0 5px var(--success));
+}
+/* PDF Preview */
+.pdf-preview {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  width: 100%;
+  height: 100%;
+  min-height: 220px;
+  padding: 32px;
+}
+
+.pdf-icon {
+  font-size: 80px;
+  color: #f87171;
+  filter: drop-shadow(0 0 18px rgba(248, 113, 113, 0.5));
+  animation: pulseLogo 2.5s infinite alternate;
+}
+
+.pdf-name {
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+  text-align: center;
+  max-width: 100%;
+}
+
+.pdf-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(248, 113, 113, 0.12);
+  border: 1px solid rgba(248, 113, 113, 0.25);
+  color: #f87171;
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 4px 12px;
+  border-radius: 20px;
 }
 </style>
