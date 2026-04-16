@@ -570,6 +570,7 @@ def _extract_text_from_pdf_sync(contents: bytes) -> dict:
                 img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
                 _, buffer = cv2.imencode('.jpg', img_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
                 pdf_preview_base64 = base64.b64encode(buffer).decode('utf-8')
+                pdf_image_size = {"width": img_np.shape[1], "height": img_np.shape[0]}
 
             page_result = _extract_text_from_numpy(img_np)
 
@@ -587,6 +588,7 @@ def _extract_text_from_pdf_sync(contents: bytes) -> dict:
             "details": all_details,
             "pages":   total_pages,
             "pdfPreviewBase64": pdf_preview_base64,
+            "imageSize": pdf_image_size if pdf_image_size else {"width": 1000, "height": 1000},
         }
     except Exception as e:
         logger.error(f"Lỗi PDF: {e}", exc_info=True)
